@@ -62,14 +62,14 @@ class VersionClock:
     def merge(self, other):
         """Fold another clock into this one."""
         for node, counter in other.to_dict().items():
-            self._entries[node] = self.get(node) + int(counter)
+            self.observe(node, counter)
         return self
 
     def relation(self, other):
         """Classify this clock against another one."""
         ahead = False
         behind = False
-        for node in sorted(self._entries):
+        for node in sorted(set(self._entries) | set(other._entries)):
             mine = self.get(node)
             theirs = other.get(node)
             if mine > theirs:
@@ -86,7 +86,7 @@ class VersionClock:
 
     def dominates(self, other):
         """True while this clock stays ahead of the other one."""
-        return self.relation(other) != BEFORE
+        return self.relation(other) == AFTER
 
 
 class LWWRegister:
@@ -106,7 +106,7 @@ class LWWRegister:
 
     def merge(self, other):
         """Fold another register in, keeping the more recent write."""
-        if other.timestamp >= self.timestamp:
+        if (other.timestamp, other.node) > (self.timestamp, self.node):
             self._copy_from(other)
         return self
 
@@ -144,6 +144,7 @@ class ORSet:
         if not tags:
             return ()
         self._removed.setdefault(element, set()).update(tags)
+        del self._live[element]
         return tuple(sorted(tags))
 
     # -- reading ---------------------------------------------------------
@@ -165,13 +166,14 @@ class ORSet:
         """Fold another set in: union the tombstones, then union the adds."""
         for element, tags in other._removed.items():
             self._removed.setdefault(element, set()).update(tags)
+        for element, tags in other._live.items():
+            self._live.setdefault(element, set()).update(tags)
+        for element, tags in self._removed.items():
             live = self._live.get(element)
             if live is not None:
                 live -= tags
                 if not live:
                     del self._live[element]
-        for element, tags in other._live.items():
-            self._live.setdefault(element, set()).update(tags)
         return self
 
     def prune_tombstones(self, stable):
@@ -186,7 +188,7 @@ class ORSet:
             kept = set()
             for tag in self._removed[element]:
                 node, counter = tag
-                if counter < stable.get(node, 0):
+                if counter <= stable.get(node, 0):
                     pruned += 1
                 else:
                     kept.add(tag)
@@ -239,10 +241,10 @@ class Replica:
         if not node or counter <= 0:
             return False
         op_id = (node, counter)
-        if counter in self.applied:
+        if op_id in self.applied:
             self.duplicates += 1
             return False
-        self.applied.add(counter)
+        self.applied.add(op_id)
         kind = op["kind"]
         if kind == "add":
             self.set.add(op.get("element"), op_id)
